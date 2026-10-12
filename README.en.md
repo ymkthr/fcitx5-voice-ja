@@ -9,7 +9,7 @@ It runs as an add-on for the fcitx5 input method framework. Press the trigger ke
 
 It supports Arch Linux, Debian, Ubuntu, and Fedora, on GNOME or KDE, under Wayland or X11.
 
-You do not have to speak punctuation. Japanese commas (、) and periods (。) are placed from the structure of the sentence, so pausing to think does not by itself add a period.
+You do not have to speak punctuation. Japanese commas (、) and periods (。) are placed from the structure of the sentence.
 Japanese homophone mix-ups such as 機会 and 機械 are reviewed against the text before the cursor, and only clear mistakes are fixed.
 Japanese or English is detected from what you say, so there is nothing to switch.
 While you speak, the text so far appears near the cursor, and long dictations of several minutes are typed in piece by piece as you go.
