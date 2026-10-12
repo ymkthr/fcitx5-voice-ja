@@ -24,9 +24,7 @@ use crate::sherpa::Transcript;
 const PAUSE_SECONDS: f32 = 0.9;
 const MARKS: &[char] = &['、', '。', '，', '．', ',', '.', '!', '?', '！', '？'];
 
-/// Nouns that open a sentence after a plain form, which otherwise modifies
-/// the noun: 思う。明日 but いい天気.
-const OPENING_NOUNS: &[&str] = &[
+const SENTENCE_OPENING_NOUNS: &[&str] = &[
     "今日",
     "きょう",
     "明日",
@@ -75,10 +73,8 @@ pub fn segmenter() -> Result<&'static Segmenter> {
     SEGMENTER.as_ref().map_err(|e| anyhow!("{e}"))
 }
 
-/// One IPADIC word of the transcript.
 struct Word {
-    /// Byte offset past the word in the text.
-    end: usize,
+    end_byte: usize,
     surface: String,
     pos: String,
     sub: String,
@@ -88,7 +84,6 @@ struct Word {
     closing: Closing,
 }
 
-/// What may follow a word.
 enum Boundary {
     Stop,
     Comma,
@@ -96,14 +91,11 @@ enum Boundary {
     None,
 }
 
-/// Whether a sentence can end on a word.
 #[derive(Clone, Copy, PartialEq)]
 enum Closing {
     No,
-    /// A plain form, which may also modify a following noun.
-    Plain,
-    /// A form that cannot modify a noun.
-    Final,
+    MayModifyNoun,
+    CannotModifyNoun,
 }
 
 /// `transcript.text` with marks at its clause boundaries.
@@ -113,15 +105,15 @@ pub fn punctuate(transcript: &Transcript) -> Result<String> {
     let mut out = String::with_capacity(text.len() + 30);
     let mut from = 0;
     for (i, word) in words.iter().enumerate() {
-        out.push_str(&text[from..word.end]);
-        from = word.end;
+        out.push_str(&text[from..word.end_byte]);
+        from = word.end_byte;
         let mark = match boundary(word, words.get(i + 1)) {
             Boundary::Stop => full_stop(&words[..=i]),
             Boundary::Comma => '、',
-            Boundary::CommaIfPaused if pauses.contains(&word.end) => '、',
+            Boundary::CommaIfPaused if pauses.contains(&word.end_byte) => '、',
             Boundary::CommaIfPaused | Boundary::None => continue,
         };
-        if !touches_mark(&text, word.end) {
+        if !touches_mark(&text, word.end_byte) {
             out.push(mark);
         }
     }
@@ -146,14 +138,7 @@ fn boundary(word: &Word, next: Option<&Word>) -> Boundary {
             "接続詞" | "副詞" | "感動詞" | "フィラー" | "連体詞" | "動詞" | "形容詞" => {
                 Boundary::Stop
             }
-            // A prefix starts a noun: 行くお店 is a relative clause.
-            "名詞" | "接頭詞"
-                if closing == Closing::Final
-                    || next.sub == "代名詞"
-                    || OPENING_NOUNS.contains(&next.surface.as_str()) =>
-            {
-                Boundary::Stop
-            }
+            "名詞" | "接頭詞" if opens_sentence_after(closing, next) => Boundary::Stop,
             _ => Boundary::None,
         };
     }
@@ -164,14 +149,12 @@ fn boundary(word: &Word, next: Option<&Word>) -> Boundary {
             "接続助詞",
             "けど" | "けれど" | "けれども" | "が" | "から" | "ので" | "のに" | "し",
         ) => Boundary::Comma,
-        ("助詞", "接続助詞", "て" | "で" | "ば") => Boundary::CommaIfPaused,
+        ("助詞", "接続助詞", "ば") => Boundary::CommaIfPaused,
+        _ if is_te_form(word) => Boundary::CommaIfPaused,
         ("助動詞", _, _) if matches!(word.base.as_str(), "た" | "だ") && word.form == "仮定形" => {
             Boundary::CommaIfPaused
         }
-        // 連用中止. Before a verb, a 連用形 more likely forms a compound verb.
-        ("動詞", "自立", _) if word.form == "連用形" && next.pos != "動詞" => {
-            Boundary::CommaIfPaused
-        }
+        _ if is_renyou_chuushi(word, next) => Boundary::CommaIfPaused,
         _ => Boundary::None,
     }
 }
@@ -180,53 +163,62 @@ fn closing(prev: Option<&Word>, word: &Word) -> Closing {
     // IPADIC tags ください before a noun as 連用形.
     if word.form.starts_with("命令") || matches!(word.surface.as_str(), "ください" | "下さい")
     {
-        return Closing::Final;
+        return Closing::CannotModifyNoun;
     }
     match word.pos.as_str() {
-        "助詞" if word.sub.contains("終助詞") => Closing::Final,
-        "助動詞" if matches!(word.base.as_str(), "う" | "よう" | "まい") => Closing::Final,
+        "助詞" if word.sub.contains("終助詞") => Closing::CannotModifyNoun,
+        "助動詞" if matches!(word.base.as_str(), "う" | "よう" | "まい") => {
+            Closing::CannotModifyNoun
+        }
         "助動詞"
             if word.form == "基本形" && matches!(word.base.as_str(), "です" | "ます" | "だ") =>
         {
-            Closing::Final
+            Closing::CannotModifyNoun
         }
-        // Unlike した and しない, でした and ません can't modify a noun.
-        "助動詞"
-            if word.form == "基本形"
-                && matches!(word.base.as_str(), "た" | "ん")
-                && prev.is_some_and(|p| {
-                    p.pos == "助動詞" && matches!(p.base.as_str(), "ます" | "です")
-                }) =>
-        {
-            Closing::Final
-        }
-        // Before a noun, みたい would need な.
-        "名詞" if word.sub == "非自立" && word.sub2 == "形容動詞語幹" => Closing::Final,
-        "動詞" | "形容詞" | "助動詞" if word.form == "基本形" => Closing::Plain,
+        "助動詞" if is_polite_past_or_negative(prev, word) => Closing::CannotModifyNoun,
+        "名詞" if is_na_adjective_stem(word) => Closing::CannotModifyNoun,
+        "動詞" | "形容詞" | "助動詞" if word.form == "基本形" => Closing::MayModifyNoun,
         _ => Closing::No,
     }
 }
 
-/// Whether `word` attaches to the word before it: ですね, 行くこと, してください.
+fn opens_sentence_after(closing: Closing, noun: &Word) -> bool {
+    closing == Closing::CannotModifyNoun
+        || noun.sub == "代名詞"
+        || SENTENCE_OPENING_NOUNS.contains(&noun.surface.as_str())
+}
+
+fn is_te_form(word: &Word) -> bool {
+    word.sub == "接続助詞" && matches!(word.surface.as_str(), "て" | "で")
+}
+
+fn is_renyou_chuushi(word: &Word, next: &Word) -> bool {
+    word.pos == "動詞" && word.sub == "自立" && word.form == "連用形" && next.pos != "動詞"
+}
+
+fn is_polite_past_or_negative(prev: Option<&Word>, word: &Word) -> bool {
+    word.form == "基本形"
+        && matches!(word.base.as_str(), "た" | "ん")
+        && prev.is_some_and(|p| p.pos == "助動詞" && matches!(p.base.as_str(), "ます" | "です"))
+}
+
+fn is_na_adjective_stem(word: &Word) -> bool {
+    word.sub == "非自立" && word.sub2 == "形容動詞語幹"
+}
+
 fn continues(word: &Word) -> bool {
     matches!(word.pos.as_str(), "助詞" | "助動詞")
         || matches!(word.sub.as_str(), "非自立" | "接尾" | "特殊")
 }
 
-/// Whether the text can't end on `word`: a particle that needs more after it
-/// (を, ので), but not a te-form, because a dictated request often ends on it.
 fn dangles(word: &Word) -> bool {
     match word.pos.as_str() {
-        "助詞" => {
-            !word.sub.contains("終助詞")
-                && !(word.sub == "接続助詞" && matches!(word.surface.as_str(), "て" | "で"))
-        }
+        "助詞" => !word.sub.contains("終助詞") && !is_te_form(word),
         "接頭詞" => true,
         _ => false,
     }
 }
 
-/// ？ when the particles and auxiliaries ending `sentence` include か.
 fn full_stop(sentence: &[Word]) -> char {
     let question = sentence
         .iter()
@@ -276,7 +268,7 @@ fn analyse(segmenter: &Segmenter, text: &str) -> Result<Vec<Word>> {
         .map_err(|e| anyhow!("morphological analysis: {e}"))?
         .into_iter()
         .map(|mut t| Word {
-            end: t.byte_end,
+            end_byte: t.byte_end,
             pos: t.get_detail(0).unwrap_or_default().to_string(),
             sub: t.get_detail(1).unwrap_or_default().to_string(),
             sub2: t.get_detail(2).unwrap_or_default().to_string(),
